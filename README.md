@@ -6,6 +6,18 @@ vault on the phone, and exports or syncs the data when you decide to.
 Built for a Samsung Galaxy S24 (Android 14), and works on any NFC phone running
 Android 10 or newer.
 
+## What's new in 0.3.0
+
+- **NDEF tag emulation** over Android Host Card Emulation (HCE). Open a saved
+  tag, tap **Emulate NDEF on this phone**, and hold the phone to a reader.
+- Emulation serves the stored NDEF message as an NFC Forum Type 4 Tag for five
+  minutes, then expires automatically.
+- This is payload emulation, not RF replay. Android generates its own NFC ID,
+  so readers that check the original UID will reject it. MIFARE Classic and
+  MIFARE Ultralight cards cannot be emulated by phone hardware.
+- The HCE service only responds while a tag is explicitly activated; otherwise
+  it returns `6A82`.
+
 ## What's new in 0.2.0
 
 - **Dark-first wallet UI** (`#0D1117` background, `#161B22` surfaces, electric
