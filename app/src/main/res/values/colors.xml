@@ -1,4 +1,34 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="ic_launcher_background">#10161F</color>
+    <color name="ic_launcher_background">#0D1117</color>
+
+    <!-- Dark-first wallet palette -->
+    <color name="bg">#0D1117</color>
+    <color name="surface">#161B22</color>
+    <color name="surface_alt">#1E1E2E</color>
+    <color name="border">#30363D</color>
+    <color name="text_primary">#E6EDF3</color>
+    <color name="text_secondary">#8B949E</color>
+
+    <color name="accent">#2F81F7</color>
+    <color name="accent_dark">#1F5FBF</color>
+    <color name="emerald">#10B981</color>
+    <color name="warning">#D29922</color>
+    <color name="danger">#F85149</color>
+
+    <!-- Category accents -->
+    <color name="cat_access">#58A6FF</color>
+    <color name="cat_asset">#3FB950</color>
+    <color name="cat_visitor">#D29922</color>
+    <color name="cat_other">#8B949E</color>
+
+    <!-- Card gradients -->
+    <color name="card_access_start">#182A44</color>
+    <color name="card_access_end">#111A29</color>
+    <color name="card_asset_start">#143027</color>
+    <color name="card_asset_end">#101D1A</color>
+    <color name="card_visitor_start">#322817</color>
+    <color name="card_visitor_end">#1D1810</color>
+    <color name="card_other_start">#1E1E2E</color>
+    <color name="card_other_end">#14141C</color>
 </resources>

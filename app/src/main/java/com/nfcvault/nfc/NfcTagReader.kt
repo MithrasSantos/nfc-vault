@@ -1,18 +1,25 @@
-package com.nfcvault
+package com.nfcvault.nfc
 
+import android.nfc.NdefMessage
 import android.nfc.NdefRecord
 import android.nfc.Tag
 import android.nfc.tech.IsoDep
 import android.nfc.tech.MifareClassic
+import android.nfc.tech.MifareUltralight
 import android.nfc.tech.Ndef
 import android.nfc.tech.NfcA
 import android.nfc.tech.NfcB
 import android.nfc.tech.NfcF
 import android.nfc.tech.NfcV
+import com.nfcvault.data.model.NdefRecordInfo
+import com.nfcvault.data.model.NfcReadResult
 import java.util.Locale
 import java.util.UUID
 
-/** Reads a [Tag] into a [ScanRecord]. Safe to call off the main thread. */
+/**
+ * Hardware layer. Extracts identity, RF metadata and NDEF content. Runs on a
+ * background thread because NDEF reads do I/O and can block until the tag moves.
+ */
 object NfcTagReader {
 
     private val URI_PREFIXES = arrayOf(
@@ -24,9 +31,13 @@ object NfcTagReader {
         "urn:epc:pat:", "urn:epc:raw:", "urn:epc:", "urn:nfc:",
     )
 
-    fun read(tag: Tag): ScanRecord {
-        val uid = tag.id?.joinToString(":") { hexByte(it) } ?: ""
-        val tech = tag.techList.map { it.substringAfterLast('.') }
+    fun read(tag: Tag): NfcReadResult {
+        val uid = tag.id
+            ?.takeIf { it.isNotEmpty() }
+            ?.joinToString(":") { hexByte(it) }
+            ?: "NOUID-${UUID.randomUUID()}"
+
+        val tech = tag.techList.map { it.substringAfterLast('.') }.sorted()
         val extras = readExtras(tag)
 
         var ndefType: String? = null
@@ -42,24 +53,18 @@ object NfcTagReader {
                 ndefType = ndef.type
                 maxSize = ndef.maxSize
                 writable = ndef.isWritable
-                val message = ndef.ndefMessage
-                if (message != null) {
+                ndef.ndefMessage?.let { message ->
                     raw = message.toByteArray().toHex()
                     records = message.records.map { parse(it) }
                 }
             } catch (_: Exception) {
-                // Tag may have moved away mid-read; keep the partial data.
+                // Tag moved away mid-read: keep the identity/hardware data.
             } finally {
-                try {
-                    ndef.close()
-                } catch (_: Exception) {
-                }
+                runCatching { ndef.close() }
             }
         }
 
-        return ScanRecord(
-            id = UUID.randomUUID().toString(),
-            time = System.currentTimeMillis(),
+        return NfcReadResult(
             uid = uid,
             tech = tech,
             extras = extras,
@@ -68,11 +73,13 @@ object NfcTagReader {
             ndefWritable = writable,
             records = records,
             rawNdefHex = raw,
+            readAt = System.currentTimeMillis(),
         )
     }
 
     private fun readExtras(tag: Tag): Map<String, String> {
         val out = linkedMapOf<String, String>()
+
         NfcA.get(tag)?.let {
             out["NfcA.atqa"] = it.atqa.toHex()
             out["NfcA.sak"] = "0x" + hexByte(it.sak.toByte())
@@ -86,6 +93,7 @@ object NfcTagReader {
             out["NfcF.systemCode"] = it.systemCode.toHex()
         }
         NfcV.get(tag)?.let {
+            out["NfcV.dsfId"] = "0x" + hexByte(it.dsfId)
             out["NfcV.responseFlags"] = "0x" + hexByte(it.responseFlags)
         }
         IsoDep.get(tag)?.let {
@@ -93,8 +101,11 @@ object NfcTagReader {
             it.historicalBytes?.let { bytes -> out["IsoDep.historicalBytes"] = bytes.toHex() }
         }
         MifareClassic.get(tag)?.let {
-            out["MifareClassic.type"] = it.type.toString()
-            out["MifareClassic.size"] = "${it.size} bytes, ${it.sectorCount} sectors"
+            out["MifareClassic.type"] = mifareClassicType(it.type)
+            out["MifareClassic.size"] = "${it.size} bytes · ${it.sectorCount} sectors · ${it.blockCount} blocks"
+        }
+        MifareUltralight.get(tag)?.let {
+            out["MifareUltralight.type"] = ultralightType(it.type)
         }
         return out
     }
@@ -115,8 +126,8 @@ object NfcTagReader {
             record.tnf == NdefRecord.TNF_WELL_KNOWN &&
                 record.type.contentEquals(NdefRecord.RTD_TEXT) && payload.isNotEmpty() -> {
                 val status = payload[0].toInt() and 0xFF
-                val langLength = status and 0x3F
-                val start = 1 + langLength
+                val languageLength = status and 0x3F
+                val start = 1 + languageLength
                 val charset = if (status and 0x80 == 0) Charsets.UTF_8 else Charsets.UTF_16
                 val text = if (start <= payload.size) {
                     String(payload, start, payload.size - start, charset)
@@ -134,35 +145,99 @@ object NfcTagReader {
                 } else {
                     ""
                 }
-                NdefRecordInfo(tnf, "U", "uri", URI_PREFIXES.getOrElse(prefix) { "" } + rest, hex)
+                val value = URI_PREFIXES.getOrElse(prefix) { "" } + rest
+                NdefRecordInfo(tnf, "U", "uri", value, hex)
             }
 
-            record.tnf == NdefRecord.TNF_MIME_MEDIA ->
-                NdefRecordInfo(tnf, typeName, "mime", preview(payload), hex)
+            record.tnf == NdefRecord.TNF_WELL_KNOWN &&
+                record.type.contentEquals("Sp".toByteArray(Charsets.US_ASCII)) -> {
+                val nested = runCatching {
+                    NdefMessage(payload).records.map { parse(it) }
+                }.getOrDefault(emptyList())
+                val value = nested.joinToString("\n") { "${it.kind}: ${it.value}" }
+                    .ifBlank { "Smart Poster · ${payload.size} bytes" }
+                NdefRecordInfo(tnf, "Sp", "smartposter", value, hex)
+            }
+
+            record.tnf == NdefRecord.TNF_MIME_MEDIA -> {
+                val mime = typeName.lowercase(Locale.US)
+                val kind = if (mime == "text/vcard" || mime == "text/x-vcard") "vcard" else "mime"
+                val value = when {
+                    kind == "vcard" -> parseVCard(payload)
+                    mime.startsWith("text/") -> textOrSize(payload)
+                    else -> binaryPreview(payload)
+                }
+                NdefRecordInfo(tnf, typeName, kind, value, hex)
+            }
 
             record.tnf == NdefRecord.TNF_ABSOLUTE_URI ->
-                NdefRecordInfo(tnf, typeName, "uri", String(payload, Charsets.UTF_8), hex)
+                NdefRecordInfo(tnf, typeName, "uri", textOrSize(payload), hex)
 
             record.tnf == NdefRecord.TNF_EXTERNAL_TYPE ->
-                NdefRecordInfo(tnf, typeName, "external", preview(payload), hex)
+                NdefRecordInfo(
+                    tnf,
+                    typeName,
+                    "external",
+                    textOrSize(payload),
+                    hex,
+                )
 
             payload.isEmpty() ->
                 NdefRecordInfo(tnf, typeName, "empty", "", "")
 
             else ->
-                NdefRecordInfo(tnf, typeName, "raw", hex, hex)
+                NdefRecordInfo(tnf, typeName, "raw", binaryPreview(payload), hex)
         }
     }
 
-    /** Text when the payload looks like text, otherwise a size hint. */
-    private fun preview(payload: ByteArray): String {
+    private fun parseVCard(payload: ByteArray): String {
+        val raw = String(payload, Charsets.UTF_8)
+        val lines = mutableListOf<String>()
+        raw.lineSequence().forEach { line ->
+            val trimmed = line.trim()
+            when {
+                trimmed.startsWith("FN:", ignoreCase = true) ->
+                    lines += "Name: ${trimmed.substringAfter(':')}"
+                trimmed.startsWith("ORG:", ignoreCase = true) ->
+                    lines += "Org: ${trimmed.substringAfter(':')}"
+                trimmed.startsWith("TITLE:", ignoreCase = true) ->
+                    lines += "Title: ${trimmed.substringAfter(':')}"
+                trimmed.startsWith("TEL", ignoreCase = true) && trimmed.contains(':') ->
+                    lines += "Phone: ${trimmed.substringAfter(':')}"
+                trimmed.startsWith("EMAIL", ignoreCase = true) && trimmed.contains(':') ->
+                    lines += "Email: ${trimmed.substringAfter(':')}"
+            }
+        }
+        return if (lines.isEmpty()) textOrSize(payload) else lines.joinToString("\n")
+    }
+
+    private fun textOrSize(payload: ByteArray): String {
         if (payload.isEmpty()) return ""
         val text = String(payload, Charsets.UTF_8)
-        if (text.isEmpty()) return "${payload.size} bytes (binary)"
         val printable = text.count {
             it == '\n' || it == '\r' || it == '\t' || it.code in 32..126
         }
-        return if (printable * 100 / text.length >= 90) text else "${payload.size} bytes (binary)"
+        return if (text.isNotEmpty() && printable * 100 / text.length >= 85) {
+            text
+        } else {
+            binaryPreview(payload)
+        }
+    }
+
+    private fun binaryPreview(payload: ByteArray): String =
+        if (payload.isEmpty()) "" else "${payload.size} bytes (binary)"
+
+    private fun mifareClassicType(type: Int): String = when (type) {
+        MifareClassic.TYPE_CLASSIC -> "Classic"
+        MifareClassic.TYPE_PLUS -> "Plus"
+        MifareClassic.TYPE_PRO -> "Pro"
+        else -> "Unknown ($type)"
+    }
+
+    private fun ultralightType(type: Int): String = when (type) {
+        MifareUltralight.TYPE_ULTRALIGHT -> "Ultralight"
+        MifareUltralight.TYPE_ULTRALIGHT_C -> "Ultralight C"
+        else -> "Unknown ($type)"
     }
 }
 

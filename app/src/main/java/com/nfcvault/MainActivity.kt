@@ -1,534 +1,870 @@
 package com.nfcvault
 
-import android.app.Activity
-import android.app.AlertDialog
-import android.content.ContentValues
 import android.content.Intent
+import android.graphics.Color
 import android.graphics.Typeface
-import android.nfc.NfcAdapter
-import android.nfc.NfcManager
-import android.nfc.Tag
 import android.os.Bundle
-import android.os.Environment
-import android.provider.MediaStore
 import android.provider.Settings
+import android.text.Editable
 import android.text.InputType
-import android.util.TypedValue
+import android.text.TextUtils
+import android.text.TextWatcher
 import android.view.Gravity
 import android.view.Menu
-import android.view.MenuItem
 import android.view.View
 import android.view.ViewGroup
-import android.widget.AbsListView
-import android.widget.BaseAdapter
-import android.widget.Button
 import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.HorizontalScrollView
+import android.widget.ImageView
 import android.widget.LinearLayout
-import android.widget.ListView
-import android.widget.ScrollView
+import android.widget.PopupMenu
 import android.widget.TextView
 import android.widget.Toast
-import java.net.HttpURLConnection
-import java.net.URL
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
+import androidx.activity.viewModels
+import androidx.appcompat.app.AppCompatActivity
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
+import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.RecyclerView
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import com.google.android.material.floatingactionbutton.ExtendedFloatingActionButton
+import com.nfcvault.data.Exporters
+import com.nfcvault.data.model.NfcCard
+import com.nfcvault.data.model.NfcStatus
+import com.nfcvault.data.model.TagCategory
+import com.nfcvault.data.model.TagInsights
+import com.nfcvault.nfc.NfcController
+import com.nfcvault.ui.ScanEvent
+import com.nfcvault.ui.ScanSheet
+import com.nfcvault.ui.SettingsSheet
+import com.nfcvault.ui.TagDetailsSheet
+import com.nfcvault.ui.Ui
+import com.nfcvault.ui.WalletAdapter
+import com.nfcvault.ui.WalletUiState
+import com.nfcvault.ui.WalletViewModel
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.launch
 
-class MainActivity : Activity() {
+class MainActivity : AppCompatActivity() {
 
-    private lateinit var store: ScanStore
-    private lateinit var scanButton: Button
-    private lateinit var statusView: TextView
-    private lateinit var listView: ListView
-    private lateinit var emptyView: TextView
-    private lateinit var adapter: ScanAdapter
+    private val viewModel: WalletViewModel by viewModels<WalletViewModel>()
 
-    private var nfc: NfcAdapter? = null
-    private var scanning = false
-    private var items: MutableList<ScanRecord> = mutableListOf()
+    private lateinit var nfcController: NfcController
+    private lateinit var adapter: WalletAdapter
+    private lateinit var recycler: RecyclerView
+    private lateinit var emptyTitle: TextView
+    private lateinit var emptyBody: TextView
+    private lateinit var emptyState: View
+    private lateinit var totalValue: TextView
+    private lateinit var lastSyncValue: TextView
+    private lateinit var lastSyncSub: TextView
+    private lateinit var nfcValue: TextView
+    private lateinit var nfcSub: TextView
+    private lateinit var searchInput: EditText
+    private lateinit var syncButton: ImageView
+    private lateinit var fab: ExtendedFloatingActionButton
+    private val categoryChips = linkedMapOf<TagCategory?, TextView>()
 
-    private val timeFmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
-
-    private val readerFlags = NfcAdapter.FLAG_READER_NFC_A or
-        NfcAdapter.FLAG_READER_NFC_B or
-        NfcAdapter.FLAG_READER_NFC_F or
-        NfcAdapter.FLAG_READER_NFC_V
+    private var scanSheet: ScanSheet? = null
+    private var lastScanToken = 0L
+    private var lastMessageToken = 0L
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        store = ScanStore(this)
-        nfc = getSystemService(NfcManager::class.java)?.defaultAdapter
+        window.statusBarColor = Ui.color(this, R.color.bg)
+        window.navigationBarColor = Ui.color(this, R.color.bg)
+
+        nfcController = NfcController(this) { tag -> viewModel.onTagRead(tag) }
         setContentView(buildUi())
-        items = store.load()
-        adapter.notifyDataSetChanged()
-        updateEmpty()
+        collectState()
+        viewModel.refreshNfcStatus()
     }
 
     override fun onResume() {
         super.onResume()
-        val adapter = nfc
-        when {
-            adapter == null -> {
-                statusView.text = "This device has no NFC hardware."
-                scanButton.isEnabled = false
-            }
-
-            !adapter.isEnabled -> {
-                statusView.text = "NFC is turned off. Tap Start scanning to open settings."
-            }
-
-            scanning -> {
-                adapter.enableReaderMode(this, { tag -> handleTag(tag) }, readerFlags, null)
-                statusView.text = "Hold a tag near the back of the phone…"
-            }
-
-            else -> {
-                statusView.text = "Ready. Press Start scanning."
-            }
-        }
+        nfcController.onResume()
+        viewModel.refreshNfcStatus()
     }
 
     override fun onPause() {
+        nfcController.onPause()
         super.onPause()
-        if (scanning) nfc?.disableReaderMode(this)
     }
 
-    // ---------------------------------------------------------------- NFC
-
-    private fun toggleScan() {
-        val adapter = nfc
-        if (adapter == null) {
-            toast("No NFC hardware on this device")
-            return
-        }
-        if (!adapter.isEnabled) {
-            toast("NFC is off — enable it in system settings")
-            startActivity(Intent(Settings.ACTION_NFC_SETTINGS))
-            return
-        }
-        if (scanning) stopScan() else startScan()
+    override fun onDestroy() {
+        nfcController.release()
+        scanSheet = null
+        super.onDestroy()
     }
 
-    private fun startScan() {
-        val adapter = nfc ?: return
-        scanning = true
-        adapter.enableReaderMode(this, { tag -> handleTag(tag) }, readerFlags, null)
-        scanButton.text = "Stop scanning"
-        statusView.text = "Hold a tag near the back of the phone…"
-    }
-
-    private fun stopScan() {
-        scanning = false
-        nfc?.disableReaderMode(this)
-        scanButton.text = "Start scanning"
-        statusView.text = "Scanning paused"
-    }
-
-    /** Runs on the NFC reader thread, not the UI thread. */
-    private fun handleTag(tag: Tag) {
-        try {
-            val record = NfcTagReader.read(tag)
-            val all = store.add(record)
-            runOnUiThread {
-                items = all
-                adapter.notifyDataSetChanged()
-                updateEmpty()
-                statusView.text = "Saved ${record.uid.ifEmpty { "tag" }} · ${timeFmt.format(Date(record.time))}"
-            }
-        } catch (e: Exception) {
-            runOnUiThread { statusView.text = "Read failed: ${e.message}" }
-        }
-    }
-
-    // ---------------------------------------------------------------- UI
+    // ------------------------------------------------------------------ UI
 
     private fun buildUi(): View {
-        val root = LinearLayout(this).apply {
+        val root = FrameLayout(this).apply {
+            setBackgroundColor(Ui.color(this@MainActivity, R.color.bg))
+        }
+        val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(16), dp(16), 0)
+            fitsSystemWindows = true
         }
+        root.addView(content, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT,
+        ))
 
-        val title = TextView(this).apply {
-            text = "NFC Vault"
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 22f)
-            setTypeface(typeface, Typeface.BOLD)
-        }
-        root.addView(title)
-
-        statusView = TextView(this).apply {
-            text = "Ready"
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
-            setPadding(0, dp(4), 0, dp(12))
-        }
-        root.addView(statusView)
-
-        scanButton = Button(this).apply {
-            text = "Start scanning"
-            isAllCaps = false
-            setOnClickListener { toggleScan() }
-        }
-        root.addView(
-            scanButton,
-            LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-            ),
-        )
-
-        val listContainer = FrameLayout(this)
-        val containerParams = LinearLayout.LayoutParams(
+        content.addView(buildHeader())
+        content.addView(buildSearch(), linearParams(top = 14, left = 20, right = 20))
+        content.addView(buildCategoryChips(), linearParams(top = 10, left = 20, right = 20))
+        content.addView(buildListArea(), LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             0,
             1f,
-        ).apply { topMargin = dp(8) }
-        root.addView(listContainer, containerParams)
+        ).apply { topMargin = Ui.dp(this@MainActivity, 10) })
 
-        listView = ListView(this).apply {
-            dividerHeight = dp(1)
-            setOnItemClickListener { _, _, position, _ ->
-                showDetails(items[position])
-            }
+        fab = ExtendedFloatingActionButton(this).apply {
+            text = "Scan tag"
+            setIconResource(R.drawable.ic_nfc)
+            isAllCaps = false
+            textSize = 14f
+            backgroundTintList = android.content.res.ColorStateList.valueOf(
+                Ui.color(this@MainActivity, R.color.accent),
+            )
+            setTextColor(Color.WHITE)
+            setIconTint(android.content.res.ColorStateList.valueOf(Color.WHITE))
+            contentDescription = "Start NFC scan"
+            setOnClickListener { requestScan() }
         }
-        adapter = ScanAdapter()
-        listView.adapter = adapter
-        listContainer.addView(
-            listView,
-            FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT,
-            ),
-        )
-
-        emptyView = TextView(this).apply {
-            text = "No scans yet.\n\nTap \u201CStart scanning\u201D and hold an NFC tag\nagainst the back of the phone."
-            gravity = Gravity.CENTER
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
-            setPadding(dp(24), 0, dp(24), 0)
-        }
-        listContainer.addView(
-            emptyView,
-            FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                Gravity.CENTER,
-            ),
-        )
+        root.addView(fab, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL,
+        ).apply { bottomMargin = Ui.dp(this@MainActivity, 24) })
 
         return root
     }
 
-    private fun updateEmpty() {
-        val empty = items.isEmpty()
-        emptyView.visibility = if (empty) View.VISIBLE else View.GONE
-        listView.visibility = if (empty) View.GONE else View.VISIBLE
+    private fun buildHeader(): View {
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(Ui.dp(this@MainActivity, 20), Ui.dp(this@MainActivity, 16), Ui.dp(this@MainActivity, 20), 0)
+        }
+        val titleRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val titleColumn = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        titleColumn.addView(Ui.text(this, "NFC Vault", 26f, bold = true))
+        titleColumn.addView(
+            Ui.text(
+                this,
+                "Enterprise tag wallet",
+                12f,
+                Ui.color(this, R.color.text_secondary),
+            ).apply { setPadding(0, Ui.dp(this@MainActivity, 2), 0, 0) },
+        )
+        titleRow.addView(titleColumn, LinearLayout.LayoutParams(
+            0,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            1f,
+        ))
+
+        syncButton = Ui.icon(this, R.drawable.ic_sync, Ui.color(this, R.color.accent), 42).apply {
+            contentDescription = "Sync all tags"
+            setOnClickListener { viewModel.syncAll() }
+        }
+        titleRow.addView(syncButton)
+        val overflow = Ui.icon(
+            this,
+            R.drawable.ic_more,
+            Ui.color(this, R.color.text_secondary),
+            42,
+        ).apply {
+            contentDescription = "More actions"
+            setOnClickListener { showOverflow(this) }
+        }
+        titleRow.addView(overflow)
+        header.addView(titleRow)
+
+        val metrics = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+        }
+        val total = metricTile("SAVED TAGS", "0", "in the vault")
+        val sync = metricTile("LAST SYNC", "Never", "queue empty")
+        val nfc = metricTile("NFC HARDWARE", "Checking…", "reader mode")
+        totalValue = total.value
+        lastSyncValue = sync.value
+        lastSyncSub = sync.sub
+        nfcValue = nfc.value
+        nfcSub = nfc.sub
+        val tileParams = { index: Int ->
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginStart = if (index == 0) 0 else Ui.dp(this@MainActivity, 6)
+                marginEnd = if (index == 2) 0 else Ui.dp(this@MainActivity, 6)
+            }
+        }
+        metrics.addView(total.tile, tileParams(0))
+        metrics.addView(sync.tile, tileParams(1))
+        metrics.addView(nfc.tile, tileParams(2))
+        header.addView(metrics, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        ).apply { topMargin = Ui.dp(this@MainActivity, 16) })
+
+        return header
     }
 
-    private fun showDetails(record: ScanRecord) {
-        val text = TextView(this).apply {
-            text = describe(record)
-            typeface = Typeface.MONOSPACE
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            setTextIsSelectable(true)
-            setPadding(dp(16), dp(8), dp(16), dp(8))
+    private fun metricTile(label: String, initial: String, initialSub: String): MetricTile {
+        val tile = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(
+                Ui.dp(this@MainActivity, 12),
+                Ui.dp(this@MainActivity, 10),
+                Ui.dp(this@MainActivity, 12),
+                Ui.dp(this@MainActivity, 10),
+            )
+            minimumHeight = Ui.dp(this@MainActivity, 70)
+            background = Ui.rounded(
+                this@MainActivity,
+                Ui.color(this@MainActivity, R.color.surface),
+                16,
+                Ui.color(this@MainActivity, R.color.border),
+            )
         }
-        val scroll = ScrollView(this).apply { addView(text) }
-
-        AlertDialog.Builder(this)
-            .setTitle("Tag details")
-            .setView(scroll)
-            .setPositiveButton("Share") { _, _ ->
-                shareText("NFC tag ${record.uid}", record.toJson().toString(2))
+        tile.addView(
+            Ui.text(
+                this,
+                label,
+                8.5f,
+                Ui.color(this, R.color.text_secondary),
+                bold = true,
+            ).apply {
+                letterSpacing = 0.08f
+                maxLines = 1
+                ellipsize = TextUtils.TruncateAt.END
+            },
+        )
+        val value = Ui.text(this, initial, 15f, Ui.color(this, R.color.text_primary), bold = true)
+            .apply {
+                setPadding(0, Ui.dp(this@MainActivity, 4), 0, 0)
+                maxLines = 1
+                ellipsize = TextUtils.TruncateAt.END
             }
-            .setNeutralButton("Delete") { _, _ -> confirmDelete(record) }
-            .setNegativeButton("Close", null)
+        val sub = Ui.text(this, initialSub, 9.5f, Ui.color(this, R.color.text_secondary))
+            .apply {
+                setPadding(0, Ui.dp(this@MainActivity, 2), 0, 0)
+                maxLines = 1
+                ellipsize = TextUtils.TruncateAt.END
+            }
+        tile.addView(value)
+        tile.addView(sub)
+        return MetricTile(tile, value, sub)
+    }
+
+    private fun buildSearch(): View {
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(
+                Ui.dp(this@MainActivity, 10),
+                Ui.dp(this@MainActivity, 2),
+                Ui.dp(this@MainActivity, 10),
+                Ui.dp(this@MainActivity, 2),
+            )
+            background = Ui.rounded(
+                this@MainActivity,
+                Ui.color(this@MainActivity, R.color.surface),
+                14,
+                Ui.color(this@MainActivity, R.color.border),
+            )
+        }
+        box.addView(Ui.icon(this, R.drawable.ic_search, Ui.color(this, R.color.text_secondary), 34))
+        searchInput = EditText(this).apply {
+            hint = "Search name, UID or category"
+            setHintTextColor(Ui.color(this@MainActivity, R.color.text_secondary))
+            setTextColor(Ui.color(this@MainActivity, R.color.text_primary))
+            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 13.5f)
+            background = null
+            isSingleLine = true
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(Ui.dp(this@MainActivity, 5), 0, 0, 0)
+            addTextChangedListener(object : TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
+                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) = Unit
+                override fun afterTextChanged(s: Editable?) {
+                    viewModel.setQuery(s?.toString().orEmpty())
+                }
+            })
+        }
+        box.addView(searchInput, LinearLayout.LayoutParams(0, Ui.dp(this@MainActivity, 44), 1f))
+        return box
+    }
+
+    private fun buildCategoryChips(): View {
+        val scroll = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+        }
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        TagCategory.filters.forEach { category ->
+            val label = when (category) {
+                null -> "All"
+                TagCategory.ACCESS -> "Access"
+                TagCategory.ASSET -> "Assets"
+                TagCategory.VISITOR -> "Visitors"
+                TagCategory.OTHER -> "Other"
+            }
+            val chip = Ui.text(this, label, 11.5f, bold = true).apply {
+                setPadding(
+                    Ui.dp(this@MainActivity, 13),
+                    Ui.dp(this@MainActivity, 7),
+                    Ui.dp(this@MainActivity, 13),
+                    Ui.dp(this@MainActivity, 7),
+                )
+                foreground = Ui.ripple()
+                isClickable = true
+                isFocusable = true
+                setOnClickListener { viewModel.setCategory(category) }
+            }
+            categoryChips[category] = chip
+            row.addView(chip, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            ).apply { marginEnd = Ui.dp(this@MainActivity, 7) })
+        }
+        scroll.addView(row)
+        return scroll
+    }
+
+    private fun buildListArea(): View {
+        val area = FrameLayout(this)
+        recycler = RecyclerView(this).apply {
+            layoutManager = LinearLayoutManager(this@MainActivity)
+            setPadding(
+                Ui.dp(this@MainActivity, 16),
+                Ui.dp(this@MainActivity, 2),
+                Ui.dp(this@MainActivity, 16),
+                Ui.dp(this@MainActivity, 112),
+            )
+            clipToPadding = false
+            setBackgroundColor(Color.TRANSPARENT)
+        }
+        adapter = WalletAdapter(
+            onOpen = { card -> openDetails(card) },
+            onCopy = { card -> Ui.copy(this@MainActivity, "UID", card.uid) },
+        )
+        recycler.adapter = adapter
+        area.addView(recycler, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT,
+        ))
+
+        val empty = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setPadding(
+                Ui.dp(this@MainActivity, 28),
+                0,
+                Ui.dp(this@MainActivity, 28),
+                Ui.dp(this@MainActivity, 70),
+            )
+        }
+        val emptyIcon = Ui.icon(
+            this,
+            R.drawable.ic_tag,
+            Ui.alpha(Ui.color(this, R.color.text_secondary), 180),
+            64,
+        ).apply { isClickable = false }
+        empty.addView(emptyIcon, LinearLayout.LayoutParams(
+            Ui.dp(this@MainActivity, 64),
+            Ui.dp(this@MainActivity, 64),
+        ).apply { gravity = Gravity.CENTER_HORIZONTAL })
+        emptyTitle = Ui.text(this, "Your vault is empty", 16f, bold = true).apply {
+            gravity = Gravity.CENTER
+            setPadding(0, Ui.dp(this@MainActivity, 12), 0, 0)
+        }
+        emptyBody = Ui.text(
+            this,
+            "Tap Scan tag and hold an NFC card near the back of the phone. " +
+                "Everything stays on this device until you export or sync.",
+            12f,
+            Ui.color(this, R.color.text_secondary),
+        ).apply {
+            gravity = Gravity.CENTER
+            setLineSpacing(Ui.dpF(this@MainActivity, 1.6f), 1f)
+            setPadding(0, Ui.dp(this@MainActivity, 6), 0, 0)
+        }
+        empty.addView(emptyTitle)
+        empty.addView(emptyBody)
+        emptyState = empty
+        area.addView(empty, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            Gravity.CENTER,
+        ))
+        return area
+    }
+
+    // ------------------------------------------------------------- state
+
+    private fun collectState() {
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                viewModel.state.collect { state -> render(state) }
+            }
+        }
+    }
+
+    private fun render(state: WalletUiState) {
+        totalValue.text = state.totalCount.toString()
+        lastSyncValue.text = if (state.syncing) {
+            "Syncing…"
+        } else {
+            TagInsights.compactTime(state.lastSyncAt)
+        }
+        lastSyncSub.text = when {
+            state.syncing -> "uploading queue"
+            state.pendingCount > 0 -> "${state.pendingCount} pending"
+            else -> "queue empty"
+        }
+        lastSyncSub.setTextColor(
+            Ui.color(
+                this,
+                if (state.pendingCount > 0) R.color.warning else R.color.text_secondary,
+            ),
+        )
+        when (state.nfcStatus) {
+            NfcStatus.READY -> {
+                nfcValue.text = "Ready"
+                nfcValue.setTextColor(Ui.color(this, R.color.emerald))
+                nfcSub.text = "reader mode"
+            }
+
+            NfcStatus.OFF -> {
+                nfcValue.text = "Off"
+                nfcValue.setTextColor(Ui.color(this, R.color.danger))
+                nfcSub.text = "tap to enable"
+            }
+
+            NfcStatus.UNAVAILABLE -> {
+                nfcValue.text = "N/A"
+                nfcValue.setTextColor(Ui.color(this, R.color.text_secondary))
+                nfcSub.text = "no hardware"
+            }
+
+            NfcStatus.UNKNOWN -> {
+                nfcValue.text = "Checking…"
+                nfcValue.setTextColor(Ui.color(this, R.color.text_secondary))
+                nfcSub.text = "reader mode"
+            }
+        }
+        syncButton.alpha = if (state.syncing) 0.45f else 1f
+        syncButton.isEnabled = !state.syncing
+
+        adapter.submitList(state.cards)
+        val noCards = state.totalCount == 0
+        val noMatches = !noCards && state.cards.isEmpty()
+        emptyState.visibility = if (noCards || noMatches) View.VISIBLE else View.GONE
+        emptyTitle.text = if (noCards) "Your vault is empty" else "No tags match your filters"
+        emptyBody.text = if (noCards) {
+            "Tap Scan tag and hold an NFC card near the back of the phone. " +
+                "Everything stays on this device until you export or sync."
+        } else {
+            "Try a different name, UID fragment or category."
+        }
+        renderCategoryChips(state.category)
+
+        state.lastScan?.let { event ->
+            if (event.token != lastScanToken) {
+                lastScanToken = event.token
+                if (event.success) {
+                    Ui.hapticSuccess(fab)
+                    if (scanSheet?.isShowing == true) {
+                        scanSheet?.onResult(event)
+                    } else {
+                        toast(event.message)
+                    }
+                } else {
+                    Ui.hapticError(fab)
+                    if (scanSheet?.isShowing == true) {
+                        scanSheet?.onResult(event)
+                    } else {
+                        toast(event.message)
+                    }
+                }
+            }
+        }
+        state.message?.let { message ->
+            if (message.token != lastMessageToken) {
+                lastMessageToken = message.token
+                toast(message.text)
+            }
+        }
+    }
+
+    private fun renderCategoryChips(selected: TagCategory?) {
+        val accent = Ui.color(this, R.color.accent)
+        val border = Ui.color(this, R.color.border)
+        categoryChips.forEach { (category, chip) ->
+            val isSelected = category == selected
+            chip.setTextColor(if (isSelected) accent else Ui.color(this, R.color.text_secondary))
+            chip.background = Ui.rounded(
+                this,
+                if (isSelected) Ui.alpha(accent, 28) else Ui.color(this, R.color.surface),
+                30,
+                if (isSelected) Ui.alpha(accent, 100) else border,
+            )
+        }
+    }
+
+    // ------------------------------------------------------------- scanning
+
+    private fun requestScan() {
+        viewModel.refreshNfcStatus()
+        when (viewModel.state.value.nfcStatus) {
+            NfcStatus.UNAVAILABLE -> toast("This phone does not report NFC hardware.")
+            NfcStatus.OFF -> showNfcOffDialog()
+            NfcStatus.READY -> startScanning()
+            NfcStatus.UNKNOWN -> {
+                toast("Checking NFC hardware…")
+                viewModel.refreshNfcStatus()
+            }
+        }
+    }
+
+    private fun startScanning() {
+        if (scanSheet?.isShowing == true) return
+        viewModel.beginScan()
+        val sheet = ScanSheet(this, viewModel.state.value.batchMode) { endScanning() }
+        scanSheet = sheet
+        sheet.show()
+        nfcController.startScanning()
+    }
+
+    private fun endScanning() {
+        nfcController.stopScanning()
+        viewModel.stopScan()
+        scanSheet = null
+    }
+
+    private fun showNfcOffDialog() {
+        MaterialAlertDialogBuilder(this)
+            .setTitle("NFC is off")
+            .setMessage(
+                "Turn on NFC to scan tags. Reader mode pauses the system payment wallet " +
+                    "only while the scan sheet is open.",
+            )
+            .setPositiveButton("Open settings") { _, _ ->
+                startActivity(Intent(Settings.ACTION_NFC_SETTINGS))
+            }
+            .setNegativeButton("Not now", null)
             .show()
     }
 
-    private fun describe(record: ScanRecord): String = buildString {
-        appendLine("UID:   ${record.uid.ifEmpty { "-" }}")
-        appendLine("Seen:  ${timeFmt.format(Date(record.time))}")
-        appendLine("Tech:  ${record.tech.joinToString(", ").ifEmpty { "-" }}")
-        record.extras.forEach { (key, value) -> appendLine("$key: $value") }
-        val ndef = record.ndefType
-        if (ndef != null) {
-            val mode = if (record.ndefWritable) "writable" else "read-only"
-            appendLine("NDEF:  $ndef, ${record.ndefMaxSize} bytes, $mode")
-        } else {
-            appendLine("NDEF:  none (tag is not formatted)")
-        }
-        if (record.records.isNotEmpty()) {
-            appendLine()
-            appendLine("Records:")
-            record.records.forEachIndexed { index, r ->
-                appendLine("  [${index + 1}] ${r.kind} (${r.type})")
-                appendLine("      ${r.value}")
-            }
-        }
-        record.rawNdefHex?.let {
-            appendLine()
-            appendLine("Raw NDEF:")
-            appendLine(it)
+    // ------------------------------------------------------------- details
+
+    private fun openDetails(card: NfcCard) {
+        viewModel.loadLogs(card.uid) { logs ->
+            if (isFinishing || isDestroyed) return@loadLogs
+            TagDetailsSheet(
+                context = this,
+                card = card,
+                logs = logs,
+                onEdit = { showEditDialog(it) },
+                onSync = { viewModel.syncCard(it.uid) },
+                onDelete = { confirmDelete(it) },
+                onExportJson = { exportOne(it, json = true) },
+                onExportCsv = { exportOne(it, json = false) },
+            ).show()
         }
     }
 
-    private fun confirmDelete(record: ScanRecord) {
-        AlertDialog.Builder(this)
-            .setTitle("Delete scan?")
-            .setMessage(record.uid.ifEmpty { "This tag" })
-            .setPositiveButton("Delete") { _, _ ->
-                items = store.remove(record.id)
-                adapter.notifyDataSetChanged()
-                updateEmpty()
-                toast("Deleted")
+    private fun showEditDialog(card: NfcCard) {
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(
+                Ui.dp(this@MainActivity, 20),
+                Ui.dp(this@MainActivity, 6),
+                Ui.dp(this@MainActivity, 20),
+                0,
+            )
+        }
+        val nameField = dialogField(
+            container,
+            "TAG NAME",
+            card.name,
+            "e.g. Main Office Badge",
+            singleLine = true,
+        )
+        val notesField = dialogField(
+            container,
+            "NOTES",
+            card.notes,
+            "Optional notes for this tag",
+            singleLine = false,
+        )
+
+        container.addView(dialogLabel("CATEGORY"), linearParams(top = 16))
+        var selected = card.category
+        val pillRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+        }
+        val pills = linkedMapOf<TagCategory, TextView>()
+        TagCategory.entries.forEach { category ->
+            val pill = Ui.text(this, category.label, 10.5f, bold = true).apply {
+                setPadding(
+                    Ui.dp(this@MainActivity, 10),
+                    Ui.dp(this@MainActivity, 6),
+                    Ui.dp(this@MainActivity, 10),
+                    Ui.dp(this@MainActivity, 6),
+                )
+                isClickable = true
+                foreground = Ui.ripple()
+                setOnClickListener {
+                    selected = category
+                    styleDialogPills(pills, selected)
+                }
             }
+            pills[category] = pill
+            pillRow.addView(pill, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            ).apply { marginEnd = Ui.dp(this@MainActivity, 6) })
+        }
+        styleDialogPills(pills, selected)
+        val pillScroll = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+        }
+        pillScroll.addView(pillRow)
+        container.addView(pillScroll, linearParams(top = 7))
+
+        MaterialAlertDialogBuilder(this)
+            .setTitle("Edit tag")
+            .setView(container)
+            .setPositiveButton("Save") { _, _ ->
+                viewModel.updateMeta(
+                    uid = card.uid,
+                    name = nameField.text.toString(),
+                    category = selected,
+                    notes = notesField.text.toString(),
+                )
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun dialogField(
+        parent: LinearLayout,
+        label: String,
+        value: String,
+        hint: String,
+        singleLine: Boolean,
+    ): EditText {
+        parent.addView(dialogLabel(label), linearParams(top = 16))
+        val field = EditText(this).apply {
+            setText(value)
+            this.hint = hint
+            setHintTextColor(Ui.color(this@MainActivity, R.color.text_secondary))
+            setTextColor(Ui.color(this@MainActivity, R.color.text_primary))
+            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 13f)
+            inputType = InputType.TYPE_CLASS_TEXT or
+                (if (singleLine) 0 else InputType.TYPE_TEXT_FLAG_MULTI_LINE)
+            if (singleLine) {
+                isSingleLine = true
+            } else {
+                minLines = 3
+                gravity = Gravity.TOP
+            }
+            setPadding(
+                Ui.dp(this@MainActivity, 12),
+                Ui.dp(this@MainActivity, 10),
+                Ui.dp(this@MainActivity, 12),
+                Ui.dp(this@MainActivity, 10),
+            )
+            background = Ui.rounded(
+                this@MainActivity,
+                Ui.color(this@MainActivity, R.color.surface_alt),
+                12,
+                Ui.color(this@MainActivity, R.color.border),
+            )
+            setSelection(text.length)
+        }
+        parent.addView(field, linearParams(top = 5))
+        return field
+    }
+
+    private fun dialogLabel(text: String): TextView = Ui.text(
+        this,
+        text,
+        9.5f,
+        Ui.color(this, R.color.text_secondary),
+        bold = true,
+    ).apply { letterSpacing = 0.12f }
+
+    private fun styleDialogPills(pills: Map<TagCategory, TextView>, selected: TagCategory) {
+        val accent = Ui.color(this, R.color.accent)
+        pills.forEach { (category, pill) ->
+            val active = category == selected
+            pill.setTextColor(if (active) accent else Ui.color(this, R.color.text_secondary))
+            pill.background = Ui.rounded(
+                this,
+                if (active) Ui.alpha(accent, 28) else Ui.color(this, R.color.surface_alt),
+                12,
+                if (active) Ui.alpha(accent, 100) else Ui.color(this, R.color.border),
+            )
+        }
+    }
+
+    private fun confirmDelete(card: NfcCard) {
+        MaterialAlertDialogBuilder(this)
+            .setTitle("Remove tag?")
+            .setMessage(
+                "${card.displayName} (${card.uid}) will be removed from this device. " +
+                    "Any pending sync for it is discarded.",
+            )
+            .setPositiveButton("Remove") { _, _ -> viewModel.delete(card.uid) }
             .setNegativeButton("Cancel", null)
             .show()
     }
 
     private fun confirmClear() {
-        if (items.isEmpty()) {
-            toast("Nothing saved yet")
+        val count = viewModel.state.value.totalCount
+        if (count == 0) {
+            toast("Nothing saved yet.")
             return
         }
-        AlertDialog.Builder(this)
-            .setTitle("Clear all scans?")
-            .setMessage("This removes all ${items.size} saved scans from this phone.")
-            .setPositiveButton("Clear") { _, _ ->
-                store.clear()
-                items = mutableListOf()
-                adapter.notifyDataSetChanged()
-                updateEmpty()
-                statusView.text = "All scans cleared"
-            }
+        MaterialAlertDialogBuilder(this)
+            .setTitle("Clear the vault?")
+            .setMessage("This permanently removes all $count saved tags and their scan history.")
+            .setPositiveButton("Clear vault") { _, _ -> viewModel.clearAll() }
             .setNegativeButton("Cancel", null)
             .show()
     }
 
-    // ---------------------------------------------------------------- export
+    // ------------------------------------------------------------- exports
 
-    private fun shareAll() {
-        if (items.isEmpty()) {
-            toast("Nothing saved yet")
+    private fun exportAll(json: Boolean, saveToDownloads: Boolean) {
+        val cards = viewModel.cardsSnapshot()
+        if (cards.isEmpty()) {
+            toast("Nothing saved yet.")
             return
         }
-        shareText("NFC Vault export (${items.size} tags)", ScanStore.exportJson(items))
-    }
-
-    private fun shareText(subject: String, body: String) {
-        val send = Intent(Intent.ACTION_SEND).apply {
-            type = "text/plain"
-            putExtra(Intent.EXTRA_SUBJECT, subject)
-            putExtra(Intent.EXTRA_TEXT, body)
-        }
-        startActivity(Intent.createChooser(send, "Share NFC data"))
-    }
-
-    private fun saveToDownloads() {
-        if (items.isEmpty()) {
-            toast("Nothing saved yet")
-            return
-        }
-        val json = ScanStore.exportJson(items)
-        val name = "nfc-vault-${System.currentTimeMillis()}.json"
-        val values = ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, name)
-            put(MediaStore.MediaColumns.MIME_TYPE, "application/json")
-            put(
-                MediaStore.MediaColumns.RELATIVE_PATH,
-                Environment.DIRECTORY_DOWNLOADS + "/NFC Vault",
+        val body = if (json) Exporters.json(cards) else Exporters.csv(cards)
+        val mime = if (json) "application/json" else "text/csv"
+        if (saveToDownloads) {
+            val extension = if (json) "json" else "csv"
+            Exporters.saveToDownloads(
+                this,
+                "nfc-vault-${System.currentTimeMillis()}.$extension",
+                mime,
+                body,
             )
-        }
-        try {
-            val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-                ?: throw IllegalStateException("could not create file")
-            contentResolver.openOutputStream(uri)?.use { out ->
-                out.write(json.toByteArray(Charsets.UTF_8))
-            } ?: throw IllegalStateException("could not open file")
-            toast("Saved to Downloads/NFC Vault/$name")
-        } catch (e: Exception) {
-            toast("Save failed: ${e.message}")
+        } else {
+            Exporters.share(this, "NFC Vault export (${cards.size} tags)", mime, body)
         }
     }
 
-    private fun uploadDialog() {
-        if (items.isEmpty()) {
-            toast("Nothing saved yet")
-            return
-        }
-        val prefs = getSharedPreferences("settings", MODE_PRIVATE)
-        val input = EditText(this).apply {
-            hint = "https://example.com/nfc"
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
-            setText(prefs.getString("upload_url", ""))
-            setSingleLine(true)
-        }
-        val box = FrameLayout(this).apply {
-            setPadding(dp(20), dp(8), dp(20), 0)
-            addView(
-                input,
-                FrameLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT,
-                ),
-            )
-        }
+    private fun exportOne(card: NfcCard, json: Boolean) {
+        val body = if (json) Exporters.json(listOf(card)) else Exporters.csv(listOf(card))
+        val mime = if (json) "application/json" else "text/csv"
+        Exporters.share(this, "NFC Vault tag ${card.uid}", mime, body)
+    }
 
-        AlertDialog.Builder(this)
-            .setTitle("Upload ${items.size} scans")
-            .setMessage("Sends the saved scans as JSON with an HTTP POST request.")
-            .setView(box)
-            .setPositiveButton("Send") { _, _ ->
-                val url = input.text.toString().trim()
-                if (!url.startsWith("http://") && !url.startsWith("https://")) {
-                    toast("Enter an http:// or https:// URL")
-                } else {
-                    prefs.edit().putString("upload_url", url).apply()
-                    postJson(url, ScanStore.exportJson(items))
-                }
+    // ------------------------------------------------------------- overflow
+
+    private fun showOverflow(anchor: View) {
+        val popup = PopupMenu(this, anchor)
+        popup.menu.add(Menu.NONE, MENU_EXPORT_JSON, 0, "Export all as JSON")
+        popup.menu.add(Menu.NONE, MENU_EXPORT_CSV, 1, "Export all as CSV")
+        popup.menu.add(Menu.NONE, MENU_SAVE_JSON, 2, "Save JSON to Downloads")
+        popup.menu.add(Menu.NONE, MENU_SYNC, 3, "Sync all")
+        popup.menu.add(Menu.NONE, MENU_SETTINGS, 4, "Settings")
+        popup.menu.add(Menu.NONE, MENU_CLEAR, 5, "Clear vault")
+        popup.menu.add(Menu.NONE, MENU_ABOUT, 6, "About")
+        popup.setOnMenuItemClickListener { item ->
+            when (item.itemId) {
+                MENU_EXPORT_JSON -> exportAll(json = true, saveToDownloads = false)
+                MENU_EXPORT_CSV -> exportAll(json = false, saveToDownloads = false)
+                MENU_SAVE_JSON -> exportAll(json = true, saveToDownloads = true)
+                MENU_SYNC -> viewModel.syncAll()
+                MENU_SETTINGS -> showSettings()
+                MENU_CLEAR -> confirmClear()
+                MENU_ABOUT -> showAbout()
+                else -> return@setOnMenuItemClickListener false
             }
-            .setNegativeButton("Cancel", null)
-            .show()
+            true
+        }
+        popup.show()
     }
 
-    private fun postJson(url: String, body: String) {
-        statusView.text = "Uploading…"
-        Thread {
-            val result = try {
-                val conn = URL(url).openConnection() as HttpURLConnection
-                conn.requestMethod = "POST"
-                conn.connectTimeout = 10_000
-                conn.readTimeout = 20_000
-                conn.doOutput = true
-                conn.setRequestProperty("Content-Type", "application/json; charset=utf-8")
-                conn.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
-                val code = conn.responseCode
-                conn.disconnect()
-                "Upload done: HTTP $code"
-            } catch (e: Exception) {
-                "Upload failed: ${e.message}"
-            }
-            runOnUiThread {
-                statusView.text = result
-                toast(result)
-            }
-        }.start()
-    }
-
-    // ---------------------------------------------------------------- menu
-
-    override fun onCreateOptionsMenu(menu: Menu): Boolean {
-        menu.add(Menu.NONE, MENU_SAVE, 0, "Save JSON to Downloads")
-        menu.add(Menu.NONE, MENU_SHARE, 1, "Share all")
-        menu.add(Menu.NONE, MENU_UPLOAD, 2, "Upload to URL…")
-        menu.add(Menu.NONE, MENU_CLEAR, 3, "Clear all")
-        menu.add(Menu.NONE, MENU_ABOUT, 4, "About")
-        return true
-    }
-
-    override fun onOptionsItemSelected(item: MenuItem): Boolean = when (item.itemId) {
-        MENU_SAVE -> {
-            saveToDownloads()
-            true
-        }
-
-        MENU_SHARE -> {
-            shareAll()
-            true
-        }
-
-        MENU_UPLOAD -> {
-            uploadDialog()
-            true
-        }
-
-        MENU_CLEAR -> {
-            confirmClear()
-            true
-        }
-
-        MENU_ABOUT -> {
-            showAbout()
-            true
-        }
-
-        else -> super.onOptionsItemSelected(item)
+    private fun showSettings() {
+        val app = application as NfcVaultApp
+        SettingsSheet(
+            context = this,
+            serverUrl = app.prefs.serverUrl,
+            deviceId = app.prefs.deviceId,
+            operatorId = app.prefs.operatorId,
+            batchMode = app.prefs.batchMode,
+            onSave = { url, operator, batch ->
+                viewModel.saveSettings(url, operator, batch)
+            },
+            onSyncNow = { viewModel.syncAll() },
+        ).show()
     }
 
     private fun showAbout() {
-        AlertDialog.Builder(this)
-            .setTitle("NFC Vault 0.1.0")
+        MaterialAlertDialogBuilder(this)
+            .setTitle("NFC Vault 0.2.0")
             .setMessage(
-                "Scans NFC tags and keeps their UID, technology and NDEF data on this phone.\n\n" +
-                    "Nothing is sent anywhere unless you share, save or upload it yourself.",
+                "Local-first enterprise NFC wallet.\n\n" +
+                    "• Scans NfcA/B/F/V and NDEF tags\n" +
+                    "• Deduplicates by UID and keeps a scan history\n" +
+                    "• Exports JSON/CSV and syncs to your own endpoint\n" +
+                    "• Data stays on this phone until you share, export or sync it.",
             )
-            .setPositiveButton("OK", null)
+            .setPositiveButton("Close", null)
             .show()
     }
 
-    // ---------------------------------------------------------------- helpers
+    // ------------------------------------------------------------- helpers
 
-    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+    private fun linearParams(
+        top: Int = 0,
+        left: Int = 0,
+        right: Int = 0,
+        bottom: Int = 0,
+    ): LinearLayout.LayoutParams = LinearLayout.LayoutParams(
+        ViewGroup.LayoutParams.MATCH_PARENT,
+        ViewGroup.LayoutParams.WRAP_CONTENT,
+    ).apply {
+        topMargin = Ui.dp(this@MainActivity, top)
+        leftMargin = Ui.dp(this@MainActivity, left)
+        rightMargin = Ui.dp(this@MainActivity, right)
+        bottomMargin = Ui.dp(this@MainActivity, bottom)
+    }
 
     private fun toast(message: String) {
         Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
     }
 
-    private fun selectableBackground(): Int {
-        val out = TypedValue()
-        theme.resolveAttribute(android.R.attr.selectableItemBackground, out, true)
-        return out.resourceId
-    }
-
-    private inner class ScanAdapter : BaseAdapter() {
-        override fun getCount(): Int = items.size
-
-        override fun getItem(position: Int): ScanRecord = items[position]
-
-        override fun getItemId(position: Int): Long = position.toLong()
-
-        override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
-            val row = if (convertView is LinearLayout) {
-                convertView
-            } else {
-                LinearLayout(this@MainActivity).apply {
-                    orientation = LinearLayout.VERTICAL
-                    setPadding(dp(16), dp(12), dp(16), dp(12))
-                    setBackgroundResource(selectableBackground())
-                    layoutParams = AbsListView.LayoutParams(
-                        ViewGroup.LayoutParams.MATCH_PARENT,
-                        ViewGroup.LayoutParams.WRAP_CONTENT,
-                    )
-                    addView(
-                        TextView(this@MainActivity).apply {
-                            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
-                            setTypeface(typeface, Typeface.BOLD)
-                        },
-                    )
-                    addView(
-                        TextView(this@MainActivity).apply {
-                            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-                        },
-                    )
-                }
-            }
-
-            val record = items[position]
-            (row.getChildAt(0) as TextView).text = record.uid.ifEmpty { "(no UID)" }
-            (row.getChildAt(1) as TextView).text = buildString {
-                append(timeFmt.format(Date(record.time)))
-                append(" · ")
-                append(record.summary())
-            }
-            return row
-        }
-    }
+    private data class MetricTile(
+        val tile: LinearLayout,
+        val value: TextView,
+        val sub: TextView,
+    )
 
     private companion object {
-        const val MENU_SAVE = 1
-        const val MENU_SHARE = 2
-        const val MENU_UPLOAD = 3
-        const val MENU_CLEAR = 4
-        const val MENU_ABOUT = 5
+        const val MENU_EXPORT_JSON = 1
+        const val MENU_EXPORT_CSV = 2
+        const val MENU_SAVE_JSON = 3
+        const val MENU_SYNC = 4
+        const val MENU_SETTINGS = 5
+        const val MENU_CLEAR = 6
+        const val MENU_ABOUT = 7
     }
 }
