@@ -58,7 +58,7 @@ for anything on the internet.
 ## Install (phone only)
 
 1. Download the latest APK:
-   <https://github.com/Hope2333/nfc-vault/releases/download/latest/app-release.apk>
+   <https://github.com/MithrasSantos/nfc-vault/releases/download/latest/app-release.apk>
 2. Open it on the S24. When Android asks, allow the browser/file manager to
    install unknown apps.
 3. Open **NFC Vault**, press **Start scanning**, hold a tag against the back of
