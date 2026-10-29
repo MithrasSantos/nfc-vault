@@ -48,11 +48,11 @@ object NfcTagReader {
 
         val ndef = Ndef.get(tag)
         if (ndef != null) {
+            ndefType = runCatching { ndef.type }.getOrNull()
+            maxSize = runCatching { ndef.maxSize }.getOrDefault(0)
+            writable = runCatching { ndef.isWritable }.getOrDefault(false)
             try {
                 ndef.connect()
-                ndefType = ndef.type
-                maxSize = ndef.maxSize
-                writable = ndef.isWritable
                 ndef.ndefMessage?.let { message ->
                     raw = message.toByteArray().toHex()
                     records = message.records.map { parse(it) }
