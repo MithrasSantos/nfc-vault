@@ -9,6 +9,7 @@ import android.nfc.tech.NfcA
 import android.nfc.tech.NfcB
 import android.nfc.tech.NfcF
 import android.nfc.tech.NfcV
+import java.util.Locale
 import java.util.UUID
 
 /** Reads a [Tag] into a [ScanRecord]. Safe to call off the main thread. */
@@ -24,7 +25,7 @@ object NfcTagReader {
     )
 
     fun read(tag: Tag): ScanRecord {
-        val uid = tag.id?.joinToString(":") { "%02X".format(it) } ?: ""
+        val uid = tag.id?.joinToString(":") { hexByte(it) } ?: ""
         val tech = tag.techList.map { it.substringAfterLast('.') }
         val extras = readExtras(tag)
 
@@ -74,7 +75,7 @@ object NfcTagReader {
         val out = linkedMapOf<String, String>()
         NfcA.get(tag)?.let {
             out["NfcA.atqa"] = it.atqa.toHex()
-            out["NfcA.sak"] = "0x%02X".format(it.sak)
+            out["NfcA.sak"] = "0x" + hexByte(it.sak.toByte())
         }
         NfcB.get(tag)?.let {
             out["NfcB.applicationData"] = it.applicationData.toHex()
@@ -85,8 +86,7 @@ object NfcTagReader {
             out["NfcF.systemCode"] = it.systemCode.toHex()
         }
         NfcV.get(tag)?.let {
-            out["NfcV.dsfid"] = "0x%02X".format(it.dsfid)
-            out["NfcV.responseFlags"] = "0x%02X".format(it.responseFlags)
+            out["NfcV.responseFlags"] = "0x" + hexByte(it.responseFlags)
         }
         IsoDep.get(tag)?.let {
             it.hiLayerResponse?.let { bytes -> out["IsoDep.hiLayerResponse"] = bytes.toHex() }
@@ -109,6 +109,7 @@ object NfcTagReader {
             else -> record.type.toHex()
         }
         val hex = payload.toHex()
+        val tnf = record.tnf.toInt()
 
         return when {
             record.tnf == NdefRecord.TNF_WELL_KNOWN &&
@@ -122,7 +123,7 @@ object NfcTagReader {
                 } else {
                     ""
                 }
-                NdefRecordInfo(record.tnf, "T", "text", text, hex)
+                NdefRecordInfo(tnf, "T", "text", text, hex)
             }
 
             record.tnf == NdefRecord.TNF_WELL_KNOWN &&
@@ -133,23 +134,23 @@ object NfcTagReader {
                 } else {
                     ""
                 }
-                NdefRecordInfo(record.tnf, "U", "uri", URI_PREFIXES.getOrElse(prefix) { "" } + rest, hex)
+                NdefRecordInfo(tnf, "U", "uri", URI_PREFIXES.getOrElse(prefix) { "" } + rest, hex)
             }
 
             record.tnf == NdefRecord.TNF_MIME_MEDIA ->
-                NdefRecordInfo(record.tnf, typeName, "mime", preview(payload), hex)
+                NdefRecordInfo(tnf, typeName, "mime", preview(payload), hex)
 
             record.tnf == NdefRecord.TNF_ABSOLUTE_URI ->
-                NdefRecordInfo(record.tnf, typeName, "uri", String(payload, Charsets.UTF_8), hex)
+                NdefRecordInfo(tnf, typeName, "uri", String(payload, Charsets.UTF_8), hex)
 
             record.tnf == NdefRecord.TNF_EXTERNAL_TYPE ->
-                NdefRecordInfo(record.tnf, typeName, "external", preview(payload), hex)
+                NdefRecordInfo(tnf, typeName, "external", preview(payload), hex)
 
             payload.isEmpty() ->
-                NdefRecordInfo(record.tnf, typeName, "empty", "", "")
+                NdefRecordInfo(tnf, typeName, "empty", "", "")
 
             else ->
-                NdefRecordInfo(record.tnf, typeName, "raw", hex, hex)
+                NdefRecordInfo(tnf, typeName, "raw", hex, hex)
         }
     }
 
@@ -165,4 +166,6 @@ object NfcTagReader {
     }
 }
 
-fun ByteArray.toHex(): String = joinToString(" ") { "%02X".format(it) }
+fun ByteArray.toHex(): String = joinToString(" ") { hexByte(it) }
+
+fun hexByte(value: Byte): String = String.format(Locale.US, "%02X", value)
