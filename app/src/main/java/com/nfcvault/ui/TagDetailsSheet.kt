@@ -26,6 +26,7 @@ class TagDetailsSheet(
     context: Context,
     private val card: NfcCard,
     private val logs: List<Long>,
+    private val onEmulate: (NfcCard) -> Unit,
     private val onEdit: (NfcCard) -> Unit,
     private val onSync: (NfcCard) -> Unit,
     private val onDelete: (NfcCard) -> Unit,
@@ -158,6 +159,28 @@ class TagDetailsSheet(
         }
 
         root.addView(sectionTitle(context, "Actions"), topMargin(context, 22))
+        val emulate = actionButton(context, "Emulate NDEF on this phone", R.drawable.ic_nfc, filled = true)
+        val canEmulate = card.hasNdef && !card.rawNdefHex.isNullOrBlank()
+        emulate.isEnabled = canEmulate
+        emulate.alpha = if (canEmulate) 1f else 0.38f
+        emulate.setOnClickListener {
+            dismiss()
+            onEmulate(card)
+        }
+        root.addView(emulate, topMargin(context, 10))
+        root.addView(
+            Ui.text(
+                context,
+                "Phones emulate NDEF / Type 4 only. MIFARE Classic, Ultralight and " +
+                    "readers that check the original card UID cannot be emulated by this hardware.",
+                10f,
+                Ui.color(context, R.color.text_secondary),
+            ).apply {
+                setPadding(0, Ui.dp(context, 7), 0, 0)
+                setLineSpacing(Ui.dpF(context, 1.4f), 1f)
+            },
+        )
+
         val edit = actionButton(context, "Edit", R.drawable.ic_edit, filled = true)
         edit.setOnClickListener {
             dismiss()

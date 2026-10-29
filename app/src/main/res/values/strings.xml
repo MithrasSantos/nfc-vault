@@ -1,4 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">NFC Vault</string>
+    <string name="emulation_service_description">NFC Vault NDEF tag emulation</string>
+    <string name="emulation_aid_group">NDEF Type 4 tags</string>
 </resources>

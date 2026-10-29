@@ -22,6 +22,7 @@ import android.widget.PopupMenu
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.viewModels
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
@@ -35,6 +36,7 @@ import com.nfcvault.data.model.NfcCard
 import com.nfcvault.data.model.NfcStatus
 import com.nfcvault.data.model.TagCategory
 import com.nfcvault.data.model.TagInsights
+import com.nfcvault.nfc.EmulationStore
 import com.nfcvault.nfc.NfcController
 import com.nfcvault.ui.ScanEvent
 import com.nfcvault.ui.ScanSheet
@@ -68,6 +70,7 @@ class MainActivity : AppCompatActivity() {
     private val categoryChips = linkedMapOf<TagCategory?, TextView>()
 
     private var scanSheet: ScanSheet? = null
+    private var emulationDialog: AlertDialog? = null
     private var lastScanToken = 0L
     private var lastMessageToken = 0L
 
@@ -96,6 +99,9 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         nfcController.release()
         scanSheet = null
+        emulationDialog?.dismiss()
+        emulationDialog = null
+        EmulationStore.deactivate(this)
         super.onDestroy()
     }
 
@@ -575,6 +581,7 @@ class MainActivity : AppCompatActivity() {
                 context = this,
                 card = card,
                 logs = logs,
+                onEmulate = { startEmulation(it) },
                 onEdit = { showEditDialog(it) },
                 onSync = { viewModel.syncCard(it.uid) },
                 onDelete = { confirmDelete(it) },
@@ -582,6 +589,48 @@ class MainActivity : AppCompatActivity() {
                 onExportCsv = { exportOne(it, json = false) },
             ).show()
         }
+    }
+
+    // ----------------------------------------------------------- emulation
+
+    private fun startEmulation(card: NfcCard) {
+        if (card.rawNdefHex.isNullOrBlank()) {
+            toast("This tag has no NDEF payload to emulate.")
+            return
+        }
+        if (viewModel.state.value.nfcStatus != NfcStatus.READY) {
+            toast("Turn on NFC to emulate a tag.")
+            return
+        }
+        if (scanSheet?.isShowing == true) endScanning()
+
+        val active = EmulationStore.activate(this, card)
+        if (active == null) {
+            toast("Could not prepare this tag for emulation.")
+            return
+        }
+
+        Ui.hapticSuccess(window.decorView)
+        emulationDialog?.dismiss()
+        emulationDialog = MaterialAlertDialogBuilder(this)
+            .setTitle("Emulating ${card.displayName}")
+            .setMessage(
+                "Hold the top of your phone against the reader.\n\n" +
+                    "NDEF / Type 4 emulation only. Android generates its own NFC ID, " +
+                    "so a reader that checks the original card UID will reject it. " +
+                    "MIFARE Classic and Ultralight cards cannot be emulated by phone hardware.\n\n" +
+                    "Emulation stops when you tap Stop or after 5 minutes.",
+            )
+            .setPositiveButton("Stop") { _, _ -> stopEmulation() }
+            .setCancelable(false)
+            .show()
+    }
+
+    private fun stopEmulation() {
+        EmulationStore.deactivate(this)
+        emulationDialog?.dismiss()
+        emulationDialog = null
+        toast("Emulation stopped")
     }
 
     private fun showEditDialog(card: NfcCard) {
